@@ -1,0 +1,1010 @@
+---
+title: "TFM - Clasificación automática de la disfonía mediante parámetros acústicos de la voz"
+author: "Nicolás López de Aguileta Castaño"
+date: "2023-01-05"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = F, warning = F)
+```
+
+```{r librerias, include=FALSE}
+# Librerías incluidas en el proyecto
+
+if(!(require(readxl))) install.packages('readxl', dep=TRUE)
+if(!(require(ggplot2))) install.packages('ggplot2', dep=TRUE)
+if(!(require(ggridges))) install.packages('ggridges', dep=TRUE)
+if(!(require(shiny))) install.packages('shiny', dep=TRUE)
+if(!(require(caret))) install.packages('caret', dep=TRUE)
+if(!(require(dplyr))) install.packages('dplyr', dep=TRUE)
+if(!(require(xgboost))) install.packages('xgboost', dep=TRUE)
+if(!(require(keras))) install.packages('keras', dep=TRUE)
+if(!(require(tensorflow))) install.packages('tensorflow', dep=TRUE)
+if(!(require(mltest))) install.packages('mltest', dep=TRUE)
+
+```
+
+```{r tema graficos,include=FALSE}
+  tema <- theme(
+    plot.title = element_text( size = (15), hjust = 0.5 ),
+    axis.title = element_text( size = (12)),
+    axis.text = element_text( size = (10)),
+    )
+```
+
+En este documento se describen todos los pasos realizados en el proyecto *Clasificación automática de la disfonía mediante parámetros acústicos de la voz.* Se entrega también el archivo R Markdown correspondiente para garantizar la reproducibilidad.
+
+# Analisis descriptivo de los datos
+
+## Carga de los datos brutos
+
+Los datos utilizados en el presente estudio, están descritos en el primer entregable del proyecto. Los datos se cargan de la tabla de excell `analisis_acustico_final.xlsx`, enviada por el departamento de Otorrinolaringologia de la CUN y revisada por el autor del proyecto. Este fichero se entrego al autor al comienzo de la fase 1 del proyecto.
+
+```{r Lectura de los datos}
+# Leemos los datos de la carpeta BBDD
+rawData<- read_excel("BBDD/Parametros Analisis Acustico.xlsx")
+
+# Comprobamos antes de nada su estructura
+str(rawData)
+```
+
+Comprobamos que tenemos `r nrow(rawData)` observaciones y `r ncol(rawData)-1` variables. Todas las variables son numéricas a excepción de `Fecha`, `Sexo` y `Clase`. Sin embargo estas dos últimas no se encuentran en su formato definitivo, como variables categóricas.
+
+```{r factorizar}
+# Categorizamos las variables Sexo y Clase
+rawData$Sexo <- factor(rawData$Sexo, levels = c("V","M") , labels = c("Hombre","Mujer"))
+rawData$Clase<-as.factor(rawData$Clase)
+
+#Positivamos los componentes aereos
+rawData$CompA_A <- -rawData$CompA_A
+rawData$CompA_E <- -rawData$CompA_E
+rawData$CompA_I <- -rawData$CompA_I
+
+#Comprobamos la estructura
+str(rawData[c("Clase","Sexo")])
+```
+Por último, eliminaremos las dos primeras variables `Fecha` e `Id`, ya que de momento no existe ningun interés en trabajar con ellas.
+
+```{r eliminacion_innecesarias}
+rawData <- subset(rawData,select = -c(1,3))
+```
+
+## Analsis de los datos faltantes
+Se han observado varias muestras con datos faltantes en algunas de las variables, con lo que se procede a cuantificarlas para tomar una decisión al respecto.
+
+Primero comprobamos el número de NA`s por variable. A continuación se muestran las variables con algun dato faltante.
+
+```{r datos_faltantes}
+# Sumamos los NAS por variable
+nas_all <- apply(is.na(rawData), 2, sum)
+#Mostramos las variables con NAS
+nas_all[nas_all!=0]
+
+# Repetimos lo mismo separando por Clase
+nas_class <- by(rawData, rawData$Clase,function(x){apply(is.na(x), 2, sum)})
+lapply(nas_class,function(x){x[x!=0]})
+```
+
+Podemos observar cómo es un número de variables bastante elevado el que presenta datos faltantes. En concreto en las frecuencias mínimas de las tres vocales encntramos en torno a un `r round(mean(nas_all[c(6,13,20)])/nrow(rawData)*100,2)`% de los observaciones incompletas, de las cuales más del 50% pertenecen a la clase `Paralisis`.
+
+```{r obs_completas}
+# Casos comletos por Clase
+by(rawData, rawData$Clase,function(x){nrow(x[complete.cases(x),])})
+```
+
+```{r obs_completas_graf}
+ggplot(data = rawData, aes(x=Clase)) + 
+  geom_bar(aes(fill = complete.cases(rawData))) +
+  xlab("Clases") + 
+  ylab("Numero de muestras") +
+  ggtitle(paste("Grafico de barras de los datos faltantes por clase")) +
+  tema +
+  scale_fill_discrete(name = "Muestras completas", labels = c("No", "Si")) 
+  
+```
+
+Al comentarlo con el especialista y el Laboratorio de Voz explican que algunos pacientes no pueden llegar a las frecuencias máximas y mínimas, ya que por su patología no pueden apenas mover la laringe, como es en el caso de la parálisis. Al realizar el estudio,en esos casos no introducian el dato, por lo que es muy interesante poder incluir esta información a la base de datos y no tratarlas como datos faltantes. Tambien existen casos en los que efectivamente no existe el dato ya que en los estudios anteriores a 2009 no se realizaba el protocolo que se lleva a cabo ahora.
+
+Se propone por lo tanto, imputar el mismo valor de la frecuencia fundamental en los primeros casos ( el paciente no puede realizar voces agudas y/o graves, nu voz es muy monótona).
+
+```{r imputacion_Min_Max}
+# Imputamos a pacientes sin Fmax y Fmin para cada una de las 3 vocales.
+voice <- rawData
+vocal_pos<-c(4,11,18)
+for (freq in vocal_pos) {
+  for (i in 1:nrow(voice)) {
+    voice[i,freq+1] <- ifelse(is.na(rawData[i,freq+1]),rawData[i,freq],rawData[i,freq+1])
+    voice[i,freq+2] <- ifelse(is.na(rawData[i,freq+2]),rawData[i,freq],rawData[i,freq+2])
+  }
+}
+
+```
+
+De igual manera, parametros como el Jitter, Shimmer, la relación armónico ruido, y el componente aéreo, no pueden ser calculados cuando presentan una muy mala calidad vocal. Por ello,  y consultándolo con el especialista, se decide imputar un valor alto a estos casos. Para ello, para cada clase se le imputa el valor máximo encontrado en dichas variables.
+
+```{r imputacionJitShim}
+voiceComp <- voice
+varNA <- c("Jitter_A", "Shimer_A","Jitter_E", "Shimer_E","Jitter_I", "Shimer_I","RAR_A","RAR_E","RAR_I", "CompA_A","CompA_E","CompA_I")
+
+for (var in varNA) {
+    voiceComp[is.na(voiceComp[var]),var] <- max(voice[var], na.rm = T)
+}
+
+voice <- voiceComp
+
+ggplot(data = voice, aes(x=Clase)) + 
+  geom_bar(aes(fill = complete.cases(voice))) +
+  xlab("Clases") + 
+  ylab("Numero de muestras") +
+  ggtitle(paste("Grafico de barras de los datos faltantes por clase")) +
+  tema +
+  scale_fill_discrete(name = "Muestras completas", labels = c("No", "Si"))
+```
+## Volumen de los datos
+
+A continucaión se muestra el volumen de pacientes pr clase y sexo.
+
+```{r sexo}
+addmargins(table(voice$Clase,voice$Sexo))
+```
+
+Actualmente tenemos un tamaño de muestras normales respeto a las patológicas desproporcionado, si contamos las sumamos en una misma clase, sin embargo si vamos clase a clase el tamaño es más uniforme.La proporción de hombre y mujeres es desproporcionada en las voces patológicas, por lo que no se han incluido muchas voces masculinas en la recogida de datos de voces normales.
+
+## Creación de nuevas variables
+
+Creamos una nueva variable que refleja cuanto podemos subir y bajar la voz respecto de nuestra frecuencia fundamental.Básicamente queremos ver el rango superior e inferior sobre nuestra frecuencia fundamental.Lo cambiaremos al porcentaje respectu su frecuencia fundamental.
+
+```{r rangos}
+
+#Para la letra A
+voice$Rmax_A<-(voice$Fmax_A-voice$FF_A)/voice$FF_A
+voice$Rmin_A<-(voice$FF_A-voice$Fmin_A)/voice$FF_A
+
+#Para la letra E
+voice$Rmax_E<-(voice$Fmax_E-voice$FF_E)/voice$FF_E
+voice$Rmin_E<-(voice$FF_E-voice$Fmin_E)/voice$FF_E
+
+#Para la letra I
+voice$Rmax_I<-(voice$Fmax_I-voice$FF_I)/voice$FF_I
+voice$Rmin_I<-(voice$FF_I-voice$Fmin_I)/voice$FF_I
+```
+
+## Analisis de las variables
+
+Exportamos los datos:
+
+```{r}
+saveRDS(voice,"voice-app/app/data.rds")
+```
+
+Para el analisis se ha creado una pequeña pagina en Shiny llamada [AhotsApp](https://ahotslab.shinyapps.io/AhotsApp/).
+
+Se sacan varias conclusiones tras su exploración. Lá mas importante de todas es que existen errores en la base de datos, ya que al observar la variable Rmax, podemos ver resultados negartivos. Esto deberia de ser imposible, ya que dado que la variable es la resta entre una frecuencia mayor que la otra, todos los resultados deberian de ser positivos. A continuación se muestra el gráfico:
+
+```{r Rmax}
+ggplot(data = voice, aes(x=Rmax_A, y=Clase,fill=Clase )) + 
+      geom_boxplot(alpha = 0.75) + 
+      xlab("Frecuencias") + 
+      ggtitle(paste("Grafico de cajas del rango máximo de la letra A por clase")) +
+      tema + 
+      scale_x_continuous(n.breaks = 10)
+```
+
+```{r}
+
+pat <- subset(voice, voice$Clase!="Normal")
+
+ggplot(data = pat, aes(x=as.factor(findInterval(pat$Edad,c(30,45,65))))) + 
+      geom_bar(aes(fill=Clase)) + 
+      xlab("Edades") + 
+      ylab("")+
+      ggtitle(paste("Edades por clase patológica")) +
+      tema +
+      scale_x_discrete(labels=c("0" = "<30", "1" = "30-45",
+                              "2" = "45-60","3" = "60<"))
+  
+```
+
+## Corrección BBDD
+
+Tras detectar y corregir la base de datos, se vuelven a cargar y procesar todos los datos: 
+
+```{r corrección_BBDD}
+# Leemos los datos de la carpeta BBDD
+rawData<- read_excel("BBDD/Parametros Analisis Acustico 03Ene.xlsx")
+# Categorizamos las variables Sexo y Clase
+rawData$Sexo <- factor(rawData$Sexo, levels = c("V","M") , labels = c("Hombre","Mujer"))
+rawData$Clase<-as.factor(rawData$Clase)
+
+#Positivamos los componentes aereos
+rawData$CompA_A <- -rawData$CompA_A
+rawData$CompA_E <- -rawData$CompA_E
+rawData$CompA_I <- -rawData$CompA_I
+
+#Eliminación de variables no utiles
+rawData <- subset(rawData,select = -c(1,3))
+
+# Imputamos a pacientes sin Fmax y Fmin para cada una de las 3 vocales.
+voice <- rawData
+vocal_pos<-c(4,11,18)
+for (freq in vocal_pos) {
+  for (i in 1:nrow(voice)) {
+    voice[i,freq+1] <- ifelse(is.na(rawData[i,freq+1]),rawData[i,freq],rawData[i,freq+1])
+    voice[i,freq+2] <- ifelse(is.na(rawData[i,freq+2]),rawData[i,freq],rawData[i,freq+2])
+  }
+}
+
+# Imputación extra
+voiceComp <- voice
+varNA <- c("Jitter_A", "Shimer_A","Jitter_E", "Shimer_E","Jitter_I", "Shimer_I","RAR_A","RAR_E","RAR_I", "CompA_A","CompA_E","CompA_I")
+
+for (var in varNA) {
+    voiceComp[is.na(voiceComp[var]),var] <- max(voice[var], na.rm = T)
+}
+
+voice <- voiceComp
+
+#Creacion de nuevas variables
+
+#Para la letra A
+voice$Rmax_A<-(voice$Fmax_A-voice$FF_A)/voice$FF_A
+voice$Rmin_A<-(voice$FF_A-voice$Fmin_A)/voice$FF_A
+
+#Para la letra E
+voice$Rmax_E<-(voice$Fmax_E-voice$FF_E)/voice$FF_E
+voice$Rmin_E<-(voice$FF_E-voice$Fmin_E)/voice$FF_E
+
+#Para la letra I
+voice$Rmax_I<-(voice$Fmax_I-voice$FF_I)/voice$FF_I
+voice$Rmin_I<-(voice$FF_I-voice$Fmin_I)/voice$FF_I
+
+
+ggplot(data = voice, aes(x=Rmax_A, y=Clase,fill=Clase )) + 
+      geom_boxplot(alpha = 0.75) + 
+      xlab("Frecuencias") + 
+      ggtitle(paste("Grafico de cajas del rango máximo de la letra A por clase")) +
+      tema + 
+      scale_x_continuous(n.breaks = 10)
+```
+```{r eliminacion_mal_calib}
+#Eliminamos las variables mal grabadas por la calibracion
+voice <- voice[-which(voice$Rmax_A<0 | voice$Rmax_E<0 |voice$Rmax_I<0|voice$Rmin_A<0|voice$Rmin_E<0|voice$Rmin_I<0),]
+```
+
+Por otro lado, como haremos una primera iteración solo clasificando pacientes sanos de enfermos, Creamos una nueva variable para diferenciarlos.
+
+```{r nueva clase}
+# Creamos la nueva clase
+voice$Clase2 <- voice$Clase
+levels(voice$Clase2)<-c("Enfermo","Enfermo","Sano","Enfermo","Enfermo")
+```
+
+Finalmente, dividimos en dos bases de datos distintas. En una se utilizan las frecuencias minimas y máximas absolutos y en la otra se utilizan como porcentaje de la frecuencia fundamental. Se elimina tambien la variable `Sexo`.
+
+```{r doble_BBDD}
+#Creamos dos nuevas bases de daos
+voiceRange <- voice[-c(5,6,12,13,19,20)]
+voiceAbs <- voice[-c(27:32)]
+```
+
+```{r}
+voiceSelect <- voiceAbs
+voiceSelect <- voiceSelect[which(voiceSelect$Sexo=="Mujer"),-1]
+```
+
+# Clasificación Sano - Enfermo 
+En este apartado comenzamos a estudiar la clasificación. Utilizaremos el paquete `caret` para la construcción y validación de los modelos, ya que con pocas lineas de código conseguimos mucho.
+
+Por otro lado, unificaremos las clases patológicas en una sola (paso previo realizado), por lo que eliminaremos de la base de datos las clases patológicas completas. Además, eliminaremos las clases incompletas, dado que preveemos en el futuro poder completar el resto de valores incompletos con alguna imputación con sentido clínico. Por lo tanto, utilizaremos siempre casos completos.
+
+```{r refinado BBDD}
+voice_fase1 <- na.omit(voiceSelect[-1])
+colnames(voice_fase1)[25] <- "Clase"
+```
+
+Para todos los algoritmos que probemos, utilizaremos el parámetro de control `train control` donde especificaremos el método "*10 times 10 fold crossvalidation*".
+
+```{r CV}
+set.seed(123)
+
+folds <- 10
+cvIndex <- createFolds(factor(voice_fase1$Clase), folds, returnTrain = T)
+ctrl <- trainControl(method = "repeatedcv",
+                     classProbs = TRUE,
+                     number = 10,
+                     repeats = 10,
+                     index = cvIndex,
+                     summaryFunction = twoClassSummary
+                     )
+
+```
+
+## K-Nearest Neighbours
+
+Como vemos en este tipo de algoritmos solo podemos variar la K. Crearemos por lo tanto un vector de distintas k's para ver que modelo afina mejor. Además, dadas las caractrerísticas del algoritmo, escalaremos y centraremos los datos como preproceso.
+
+
+```{r knn1}
+set.seed(123)
+
+preProcValues <- preProcess(voice_fase1,method = c("center", "scale"))
+normTraining <- predict(preProcValues,voice_fase1)
+
+knn_fase1 <- caret ::train(Clase~., 
+           data = normTraining, 
+           method = "knn",
+           metric = "ROC",
+           trControl = ctrl,
+           tuneGrid = data.frame(k = seq(1,10,by = 1))
+           )
+knn_fase1
+```
+
+Corroboramos, esta vez con un, que el modelo es muy bueno clasificando los datos.
+
+## Decision Tree
+
+```{r dt1}
+set.seed(123)
+
+dt_fase1 <-caret:: train(Clase ~ . ,
+                     data = voice_fase1,
+                     method = "C5.0",
+                     metric = "ROC",
+                     trControl = ctrl,
+                     tuneGrid = expand.grid( .winnow = c(TRUE,FALSE), .trials=c(1,5,10,15,20), .model="tree" )
+                    )
+dt_fase1
+```
+
+
+## Random forest
+
+```{r rf1}
+rf_fase1 <-caret:: train(Clase ~ . , 
+                     data = voice_fase1, 
+                     method = "rf",
+                     metric = "ROC", 
+                     trControl = ctrl,
+                     tuneGrid = expand.grid(.mtry = c(2,5,10,17,26)))
+rf_fase1
+```
+
+## SVM Lineal
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmlin}
+set.seed(123)
+
+svmlin_fase1 <- caret :: train(Clase~., 
+           data = voice_fase1, 
+           method = "svmLinear",
+           metric = "ROC",
+           trControl = ctrl,
+           tuneGrid = expand.grid(C = seq(0.2, 2, by = 0.2))
+           )
+svmlin_fase1
+```
+
+## SVM Radial
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmrad}
+set.seed(123)
+
+svmrad_fase1 <- caret :: train(Clase~., 
+           data = voice_fase1, 
+           method = "svmRadial",
+           metric = "ROC",
+           trControl = ctrl
+           )
+svmrad_fase1
+```
+
+## Global
+
+```{r total_fase1_abs}
+Abs_Fase1<-tibble(Model=c('KNN','Decision Tree','Random Forest','SVM Lineal','SVM Radial'),ROC=c(max(knn_fase1$results$ROC),max(dt_fase1$results$ROC),max(rf_fase1$results$ROC),max(svmlin_fase1$results$ROC),max(svmrad_fase1$results$ROC)))
+Abs_Fase1 %>% arrange(ROC)
+
+```
+
+```{r otraVar}
+set.seed(123)
+
+voice_fase1  <- voiceRange
+
+voice_fase1 <- na.omit(voiceSelect[-1])
+colnames(voice_fase1)[25] <- "Clase"
+
+preProcValues <- preProcess(voice_fase1,method = c("center", "scale"))
+normTraining <- predict(preProcValues,voice_fase1)
+
+knn_fase1 <- caret ::train(Clase~., 
+           data = normTraining, 
+           method = "knn",
+           metric = "ROC",
+           trControl = ctrl,
+           tuneGrid = data.frame(k = seq(1,10,by = 1))
+           )
+
+dt_fase1 <-caret:: train(Clase ~ . ,
+                     data = voice_fase1,
+                     method = "C5.0",
+                     metric = "ROC",
+                     trControl = ctrl,
+                     tuneGrid = expand.grid( .winnow = c(TRUE,FALSE), .trials=c(1,5,10,15,20), .model="tree" )
+                    )
+
+rf_fase1 <-caret:: train(Clase ~ . , 
+                     data = voice_fase1, 
+                     method = "rf",
+                     metric = "ROC", 
+                     trControl = ctrl,
+                     tuneGrid = expand.grid(.mtry = c(2,5,10,17,26)))
+
+svmlin_fase1 <- caret :: train(Clase~., 
+           data = voice_fase1, 
+           method = "svmLinear",
+           metric = "ROC",
+           trControl = ctrl,
+           tuneGrid = expand.grid(C = seq(0.2, 2, by = 0.2))
+           )
+
+svmrad_fase1 <- caret :: train(Clase~., 
+           data = voice_fase1, 
+           method = "svmRadial",
+           metric = "ROC",
+           trControl = ctrl
+           )
+
+rel_Fase1<-tibble(Model=c('KNN','Decision Tree','Random Forest','SVM Lineal','SVM Radial'),ROC=c(max(knn_fase1$results$ROC),max(dt_fase1$results$ROC),max(rf_fase1$results$ROC),max(svmlin_fase1$results$ROC),max(svmrad_fase1$results$ROC)))
+rel_Fase1 %>% arrange(ROC)
+
+```
+
+# Clasificacion por patologia
+
+# Todas las clases
+
+
+```{r refinado BBDD_all}
+voice_fase2 <- na.omit(voiceAbs[-27])
+voice_fase2 <- voice_fase2[which(voice_fase2$Sexo=="Mujer"),-2]
+```
+
+```{r data_partition_all}
+set.seed(123)
+
+inTraining <- createDataPartition(voice_fase2$Clase,p=.75,list = FALSE)
+training <- voice_fase2[ inTraining,]
+testing  <- voice_fase2[-inTraining,]
+```
+
+
+```{r tablas_all}
+table(testing$Clase)
+table(training$Clase)
+```
+
+
+```{r CV_all}
+set.seed(123)
+
+folds <- 10
+cvIndex <- createFolds(factor(training$Clase), folds, returnTrain = T)
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     index = cvIndex,
+                     summaryFunction = multiClassSummary
+                     )
+```
+
+## K-Nearest Neighbours
+
+Como vemos en este tipo de algoritmos solo podemos variar la K. Crearemos por lo tanto un vector de distintas k's para ver que modelo afina mejor. Además, dadas las caractrerísticas del algoritmo, escalaremos y centraremos los datos como preproceso.
+
+
+```{r knn_all}
+set.seed(123)
+
+preProcValues <- preProcess(training,method = c("center", "scale"))
+normTraining <- predict(preProcValues,training)
+
+knn_all <- caret ::train(Clase~., 
+           data = normTraining, 
+           method = "knn",
+           metric = "Kappa",
+           trControl = ctrl,
+           tuneGrid = data.frame(k = seq(1,10,by = 1))
+           )
+knn_all
+```
+
+```{r knn_all_pred}
+set.seed(123)
+
+normTest <- predict(preProcValues,testing)
+p <-predict(knn_all, newdata = normTest)
+
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+## Decision Tree
+
+```{r dt_all}
+set.seed(123)
+
+dt_all <-caret:: train(Clase ~ . ,
+                     data = training,
+                     method = "C5.0",
+                     metric = "Kappa",
+                     trControl = ctrl,
+                     tuneGrid = expand.grid( .winnow = c(TRUE,FALSE), .trials=c(1,5,10,15,20), .model="tree" )
+                    )
+dt_all
+```
+
+```{r dt_all_pred}
+set.seed(123)
+
+p <-predict(dt_all, newdata = testing)
+
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+## Random forest
+
+```{r rf_all}
+set.seed(123)
+
+rf_all <-caret:: train(Clase ~ . , 
+                     data = training, 
+                     method = "rf",
+                     metric = "Kappa", 
+                     trControl = ctrl,
+                     tuneGrid = expand.grid(.mtry = c(2,5,10,17,26)))
+rf_all
+```
+
+```{r rf_all_pred}
+set.seed(123)
+
+p <-predict(rf_all, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+## SVM Lineal
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmlin_all}
+set.seed(123)
+
+svmlin_all <- caret :: train(Clase~., 
+           data = training, 
+           method = "svmLinear",
+           metric = "Kappa",
+           trControl = ctrl,
+           tuneGrid = expand.grid(C = seq(0.2, 2, by = 0.2))
+           )
+svmlin_all
+```
+
+```{r svmlin_all_pred}
+set.seed(123)
+
+p <-predict(svmlin_all, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+## SVM Radial
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmrad_all}
+set.seed(123)
+
+svmrad_all <- caret :: train(Clase~., 
+           data = training, 
+           method = "svmRadial",
+           metric = "Kappa",
+           trControl = ctrl
+           )
+svmrad_all
+```
+
+```{r svmrad_all_pred}
+set.seed(123)
+
+p <-predict(svmrad_all, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+## XGBoost
+
+```{r xgboost_all}
+set.seed(123)
+
+dat <- voice_fase2
+dat$Clase <- as.numeric(dat$Clase)
+dat$Clase <- dat$Clase - 1
+
+# Full data set
+data_variables <- as.matrix(dat[,-1])
+data_label <- as.matrix( dat[,"Clase"])
+data_matrix <- xgb.DMatrix(data = as.matrix(dat), label = data_label)
+# split train data and make xgb.DMatrix
+train_data   <- data_variables[inTraining,]
+train_label  <- data_label[inTraining,]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- data_variables[-inTraining,]
+test_label <- data_label[-inTraining]
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+
+xgboost_all <- xgboost:: xgboost(data = train_matrix, 
+ eta = 0.1,
+ max_depth = 15, 
+ nround=30, 
+ subsample = 0.5,
+ colsample_bytree = 0.5,
+ eval_metric = "mlogloss",
+ objective = "multi:softprob",
+ num_class = 5,
+ nthread = 3,
+ verbose = F
+)
+```
+
+```{r xgboost_all_pred}
+set.seed(123)
+
+xgb_preds <- predict(xgboost_all, test_matrix, reshape = TRUE)
+xgb_preds <- as.data.frame(xgb_preds)
+colnames(xgb_preds) <- levels(voice_fase2$Clase)
+
+xgb_preds$PredictedClass <- apply(xgb_preds, 1, function(y) colnames(xgb_preds)[which.max(y)])
+
+xgb_preds$ActualClass <- levels(voice_fase2$Clase)[test_label + 1]
+
+confusionMatrix(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass))$table
+confusionMatrix(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass))$overall[2]
+round(ml_test(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass))$balanced.accuracy,3)
+```
+
+## Keras
+
+```{r ann_all}
+set.seed(123)
+
+train.x <- keras::normalize(as.matrix(training[, -1]))
+train.y <- to_categorical(as.matrix(as.numeric(unlist(training[1]))-1))
+
+test.x <- keras::normalize(as.matrix(testing[, -1]))
+test.y <- to_categorical(as.matrix(as.numeric(unlist(testing[1]))-1))
+
+ann_all <- keras_model_sequential() %>% 
+  layer_dense(units=60, activation = "relu", input_shape = c(24)) %>%
+  layer_dense(units=30, activation = "relu") %>%
+  layer_dense(units =5, activation = "softmax")  
+ 
+ann_all %>% compile(optimizer = "adam", 
+                  loss = "categorical_crossentropy",  
+                  metric=c("kappa"),
+                  )
+
+ann_all %>% keras:: fit(train.x, 
+              train.y,
+              epochs = 300, 
+              batch_size = 20,
+              validation_data = list(test.x, test.y),
+              view_metrics = FALSE
+              )
+```
+
+
+```{r ann_all_pred}
+set.seed(123)
+
+pred <-predict(ann_all,test.x)
+pred <- format(round(pred, 2), nsamll = 5)
+
+result <- data.frame("DTM"=pred[,1], 
+                     "Neurologicas"=pred[,2], 
+                     "Normal"=pred[,3], 
+                     "Organicas"=pred[,4],
+                     "Paralisis"=pred[,5],
+                     "Predicted" = ifelse(max.col(pred[ ,1:5])==1, "DTM",
+                                          ifelse(max.col(pred[ ,1:5])==2,"Neurologicas",
+                                                 ifelse(max.col(pred[ ,1:5])==3,"Normal" ,
+                                                        ifelse(max.col(pred[ ,1:5])==4,"Organicas",
+                                                                    "Paralisis")))), Original = testing$Clase)
+print(result)
+
+confusionMatrix(factor(result$Predicted, levels = levels(result$Original)), result$Original)$table
+confusionMatrix(factor(result$Predicted, levels = levels(result$Original)), result$Original)$overall[2]
+round(ml_test(factor(result$Predicted, levels = levels(result$Original)), result$Original)$balanced.accuracy,3)
+```
+
+## No DTM
+
+```{r subset}
+
+no_DTM <- subset(voice_fase2,voice_fase2$Clase!="DTM")
+no_DTM$Clase<- factor(no_DTM$Clase,levels = c("Normal","Paralisis","Organicas","Neurologicas"))
+```
+
+```{r refinado BBDD_NoDTM}
+voice_fase2 <- no_DTM
+
+```
+
+```{r division_validation_No_DTM}
+set.seed(123)
+
+inTraining <- createDataPartition(voice_fase2$Clase,p=.75,list = FALSE)
+training <- voice_fase2[ inTraining,]
+testing  <- voice_fase2[-inTraining,]
+```
+
+
+```{r CV_No_DTM}
+set.seed(123)
+
+folds <- 10
+cvIndex <- createFolds(factor(training$Clase), folds, returnTrain = T)
+
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 10,
+                     index = cvIndex,
+                     summaryFunction = multiClassSummary
+)
+```
+
+## K-Nearest Neighbours
+
+Como vemos en este tipo de algoritmos solo podemos variar la K. Crearemos por lo tanto un vector de distintas k's para ver que modelo afina mejor. Además, dadas las caractrerísticas del algoritmo, escalaremos y centraremos los datos como preproceso.
+
+
+```{r knn_No_DTM}
+set.seed(123)
+
+preProcValues <- preProcess(training,method = c("center", "scale"))
+normTraining <- predict(preProcValues,training)
+
+knn_No_DTM <- caret ::train(Clase~., 
+           data = normTraining, 
+           method = "knn",
+           metric = "Kappa",
+           trControl = ctrl,
+           tuneGrid = data.frame(k = seq(1,10,by = 1))
+           )
+knn_No_DTM
+```
+
+```{r knn_No_DTM_pred}
+set.seed(123)
+
+normTest <- predict(preProcValues,testing)
+
+p <-predict(knn_No_DTM, newdata = normTest)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+## Decision Tree
+
+```{r dt_No_DTM}
+set.seed(123)
+
+dt_No_DTM <-caret:: train(Clase ~ . ,
+                     data = training,
+                     method = "C5.0",
+                     metric = "Kappa",
+                     trControl = ctrl,
+                     tuneGrid = expand.grid( .winnow = c(TRUE,FALSE), .trials=c(1,5,10,15,20), .model="tree" )
+                    )
+dt_No_DTM
+```
+
+```{r dt_No_DTM_pred}
+set.seed(123)
+
+p <-predict(dt_No_DTM, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+## Random forest
+
+```{r rf_No_DTM}
+set.seed(123)
+
+rf_No_DTM <-caret:: train(Clase ~ . , 
+                     data = training, 
+                     method = "rf",
+                     metric = "Kappa", 
+                     trControl = ctrl,
+                     tuneGrid = expand.grid(.mtry = c(2,5,10,17,26)))
+rf_No_DTM
+```
+
+```{r rf_No_DTM_pred}
+set.seed(123)
+
+p <-predict(rf_No_DTM, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+## SVM Lineal
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmlin_No_DTM}
+set.seed(123)
+
+svmlin_No_DTM <- caret :: train(Clase~., 
+                               data = training, 
+                               method = "svmLinear",
+                               metric = "Kappa",
+                               trControl = ctrl,
+                               tuneGrid = expand.grid(C = seq(0.2, 2, by = 0.2))
+)
+svmlin_No_DTM
+```
+
+```{r svmlin_No_DTM_Pred}
+set.seed(123)
+
+p <-predict(svmlin_No_DTM, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+
+## SVM Radial
+
+Como vemos en este tipo de algoritmos solo podemos variar la C. Crearemos por lo tanto un vector de distintas C's para ver que modelo afina mejor.
+
+```{r svmrad_No_DTM}
+set.seed(123)
+
+svmrad_No_DTM <- caret :: train(Clase~., 
+           data = training, 
+           method = "svmRadial",
+           metric = "Kappa",
+           trControl = ctrl
+           )
+svmrad_No_DTM
+```
+
+```{r svmrad_No_DTM_pred}
+set.seed(123)
+
+p <-predict(svmrad_No_DTM, newdata = testing)
+confusionMatrix(p,testing$Clase)$table
+confusionMatrix(p,testing$Clase)$overall[2]
+round(ml_test(p,testing$Clase)$balanced.accuracy,3)
+```
+
+
+## XGBoost
+
+```{r XGBoost_No_DTM}
+set.seed(123)
+
+dat <- voice_fase2
+dat$Clase <- as.numeric(dat$Clase)
+dat$Clase <- dat$Clase - 1
+
+# Full data set
+data_variables <- as.matrix(dat[,-1])
+data_label <- as.matrix( dat[,"Clase"])
+data_matrix <- xgb.DMatrix(data = as.matrix(dat), label = data_label)
+# split train data and make xgb.DMatrix
+train_data   <- data_variables[inTraining,]
+train_label  <- data_label[inTraining,]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- data_variables[-inTraining,]
+test_label <- data_label[-inTraining]
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+
+xgb_No_DTM <- xgboost:: xgboost(data = train_matrix, 
+ eta = 0.1,
+ max_depth = 15, 
+ nround=30, 
+ subsample = 0.5,
+ colsample_bytree = 0.5,
+ eval_metric = "mlogloss",
+ objective = "multi:softprob",
+ num_class = 4,
+ nthread = 3,
+ verbose = F
+)
+```
+
+```{r}
+set.seed(123)
+
+xgb_preds <- predict(xgb_No_DTM, test_matrix, reshape = TRUE)
+xgb_preds <- as.data.frame(xgb_preds)
+colnames(xgb_preds) <- levels(voice_fase2$Clase)
+
+xgb_preds$PredictedClass <- apply(xgb_preds, 1, function(y) colnames(xgb_preds)[which.max(y)])
+
+xgb_preds$ActualClass <- levels(voice_fase2$Clase)[test_label + 1]
+
+confusionMatrix(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass))$table
+confusionMatrix(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass))$overall[2]
+round(ml_test(factor(xgb_preds$PredictedClass, levels = levels(testing$Clase)),factor(xgb_preds$ActualClass, levels = levels(testing$Clase)))$balanced.accuracy,3)
+```
+
+## Keras
+
+```{r ann_No_DTM}
+set.seed(123)
+
+train.x <- keras::normalize(as.matrix(training[, -1]))
+train.y <- to_categorical(as.matrix(as.numeric(unlist(training[1]))-1))
+
+test.x <- keras::normalize(as.matrix(testing[, -1]))
+test.y <- to_categorical(as.matrix(as.numeric(unlist(testing[1]))-1))
+
+ann_No_DTM <- keras_model_sequential() %>% 
+  layer_dense(units=60, activation = "relu", input_shape = c(24)) %>%
+  layer_dense(units=20, activation = "relu") %>%
+  layer_dense(units =4, activation = "softmax")  
+ 
+ann_No_DTM %>% compile(optimizer = "adam", 
+                  loss = "categorical_crossentropy",  
+                  metric=c("accuracy"),
+                  )
+
+ann_No_DTM %>% keras:: fit(train.x, 
+              train.y,
+              epochs = 300, 
+              batch_size = 10,
+              validation_data = list(test.x, test.y)
+              )
+```
+
+
+```{r ann_No_DTM_pred}
+set.seed(123)
+
+pred <-ann_No_DTM %>% predict(test.x)
+pred <- format(round(pred, 2), nsamll = 4)
+
+result <- data.frame("Normal"=pred[,1], 
+                     "Paralisis"=pred[,2], 
+                     "Organicas"=pred[,3], 
+                     "Neurologicas"=pred[,4],
+                     "Predicted" = ifelse(max.col(pred[ ,1:4])==1, "Normal",
+                                           ifelse(max.col(pred[ ,1:4])==2,"Paralisis",
+                                                  ifelse(max.col(pred[ ,1:4])==3,"Organicas" ,
+                                                                    "Neurologicas"))), Original = testing$Clase)
+print(result)
+
+confusionMatrix(factor(result$Predicted, levels = levels(result$Original)), result$Original)$table
+confusionMatrix(factor(result$Predicted, levels = levels(result$Original)), result$Original)$overall[2]
+round(ml_test(factor(result$Predicted, levels = levels(result$Original)), result$Original)$balanced.accuracy,3)
+```
